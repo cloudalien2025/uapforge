@@ -1,0 +1,278 @@
+# app.py — UAPForge (AI Render only) v1.0
+import base64
+import io
+import time
+import zipfile
+from dataclasses import dataclass
+from typing import Optional, Tuple, List
+
+import requests
+import streamlit as st
+from PIL import Image
+
+APP_TITLE = "UAPForge — AI Render (CapCut Ready)"
+
+# OpenAI image API supported sizes (commonly used for gpt-image-1 style endpoints)
+# We generate at one of these, then crop/resize to the final CapCut format.
+OPENAI_SIZES = ["1024x1536", "1536x1024", "1024x1024", "auto"]
+DEFAULT_OPENAI_SIZE_PORTRAIT = "1024x1536"
+DEFAULT_OPENAI_SIZE_LANDSCAPE = "1536x1024"
+
+DEFAULT_WEBP_QUALITY = 82
+MAX_KEYWORDS = 25
+
+CAPCUT_PRESETS = {
+    "Vertical 9:16 (1080×1920) — Shorts/Reels": (1080, 1920),
+    "Landscape 16:9 (1920×1080) — YouTube/Doc": (1920, 1080),
+    "4K Landscape 16:9 (3840×2160) — Ultra": (3840, 2160),
+}
+
+# ---------- helpers ----------
+def slugify(s: str) -> str:
+    out = "".join(c if c.isalnum() else "-" for c in (s or "").strip().lower()).strip("-")
+    return out or "image"
+
+def center_crop_and_resize(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    """
+    Scale to cover (target_w, target_h), then center-crop.
+    Great for CapCut (room for zoom/pan without black bars).
+    """
+    img = img.convert("RGB")
+    src_w, src_h = img.size
+    scale = max(target_w / src_w, target_h / src_h)
+    new_size = (int(src_w * scale), int(src_h * scale))
+    img = img.resize(new_size, Image.LANCZOS)
+
+    left = (img.width - target_w) // 2
+    top = (img.height - target_h) // 2
+    return img.crop((left, top, left + target_w, top + target_h))
+
+def to_webp_bytes(img: Image.Image, quality: int = DEFAULT_WEBP_QUALITY) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="WEBP", quality=int(quality), method=6)
+    return buf.getvalue()
+
+# ---------- OpenAI Client ----------
+@dataclass
+class OpenAIClient:
+    api_key: str
+    base_url: str = "https://api.openai.com/v1"
+
+    def generate_image(self, prompt: str, model: str, size: str, timeout: int = 90) -> requests.Response:
+        url = f"{self.base_url}/images/generations"
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        payload = {"model": model, "prompt": prompt.strip(), "size": size, "n": 1}
+        return requests.post(url, headers=headers, json=payload, timeout=timeout)
+
+def _bytes_from_openai_item(item: dict, timeout: int = 90) -> Optional[bytes]:
+    if item.get("b64_json"):
+        return base64.b64decode(item["b64_json"])
+    if item.get("url"):
+        r = requests.get(item["url"], timeout=timeout)
+        r.raise_for_status()
+        return r.content
+    return None
+
+def pick_openai_size_for_target(target_w: int, target_h: int) -> str:
+    # Prefer portrait base for vertical, landscape base for horizontal, square if close
+    if target_h > target_w:
+        return DEFAULT_OPENAI_SIZE_PORTRAIT
+    if target_w > target_h:
+        return DEFAULT_OPENAI_SIZE_LANDSCAPE
+    return "1024x1024"
+
+def generate_capcut_image_webp(
+    client: OpenAIClient,
+    prompt: str,
+    model: str,
+    openai_size: str,
+    target_w: int,
+    target_h: int,
+    webp_quality: int,
+    max_retries: int = 4,
+    timeout_s: int = 90,
+) -> Tuple[Optional[bytes], Optional[str]]:
+    """
+    Generate with OpenAI, then convert to exact CapCut-ready resolution.
+    Retries transient errors with backoff.
+    """
+    delay = 1.2
+    last_err = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = client.generate_image(prompt=prompt, model=model, size=openai_size, timeout=timeout_s)
+
+            if resp.status_code == 200:
+                data = resp.json()
+                if not data.get("data"):
+                    return None, "OpenAI returned no image data."
+                raw = _bytes_from_openai_item(data["data"][0], timeout=timeout_s)
+                if not raw:
+                    return None, "OpenAI returned an empty image payload."
+
+                img = Image.open(io.BytesIO(raw)).convert("RGB")
+                final_img = center_crop_and_resize(img, target_w, target_h)
+                return to_webp_bytes(final_img, webp_quality), None
+
+            # Parse error message
+            try:
+                j = resp.json()
+                last_err = j.get("error", {}).get("message", resp.text)
+            except Exception:
+                last_err = resp.text
+
+            transient = any(x in (last_err or "").lower() for x in [
+                "rate limit", "429", "timeout", "timed out", "gateway", "overloaded", "502", "503", "504"
+            ])
+            if transient:
+                time.sleep(delay)
+                delay *= 1.8
+                continue
+
+        except Exception as e:
+            last_err = str(e)
+            transient = any(x in last_err.lower() for x in [
+                "rate limit", "429", "timeout", "timed out", "gateway", "overloaded", "502", "503", "504"
+            ])
+            if transient:
+                time.sleep(delay)
+                delay *= 1.8
+                continue
+
+        # Non-transient or retry exhausted
+        break
+
+    return None, f"Image generation failed after {max_retries} attempt(s): {last_err}"
+
+# ---------- UI ----------
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.title(APP_TITLE)
+st.caption("AI-only image generation. Outputs are automatically cropped/resized for CapCut.")
+
+# Keys (prefer Streamlit secrets)
+secret_key = None
+try:
+    secret_key = st.secrets.get("OPENAI_API_KEY")
+except Exception:
+    secret_key = None
+
+st.sidebar.header("API Key")
+openai_key = st.sidebar.text_input(
+    "OpenAI API key",
+    type="password",
+    value=secret_key or "",
+    help="Best practice: set this in Streamlit secrets as OPENAI_API_KEY.",
+)
+
+st.sidebar.header("Output")
+preset_label = st.sidebar.selectbox("CapCut output preset", list(CAPCUT_PRESETS.keys()), index=0)
+target_w, target_h = CAPCUT_PRESETS[preset_label]
+
+webp_quality = st.sidebar.slider("WEBP quality", 40, 100, DEFAULT_WEBP_QUALITY)
+
+with st.sidebar.expander("Advanced", expanded=False):
+    model = st.selectbox("OpenAI image model", ["gpt-image-1", "dall-e-3"], index=0)
+    openai_size_mode = st.radio(
+        "OpenAI base size",
+        ["Auto-pick for preset", "Force a base size"],
+        index=0,
+        help="Auto-pick chooses portrait base for 9:16 and landscape base for 16:9.",
+    )
+    forced_size = st.selectbox("Forced size", OPENAI_SIZES, index=OPENAI_SIZES.index("1024x1536"))
+
+st.subheader("Input")
+st.write("Paste prompts / keywords (one per line).")
+keywords_text = st.text_area(
+    "",
+    height=160,
+    placeholder="UAP hovering over rural highway at night, cinematic, realistic\n1950s radar room, tense mood, grainy documentary still\n..."
+)
+keywords = [k.strip() for k in keywords_text.split("\n") if k.strip()]
+
+colA, colB, colC = st.columns([1, 1, 2])
+with colA:
+    go = st.button("Generate images", type="primary")
+with colB:
+    if st.button("Clear"):
+        st.rerun()
+with colC:
+    st.info(f"Preset output: **{target_w}×{target_h}**")
+
+st.markdown("---")
+
+if go:
+    if not openai_key:
+        st.error("Add your OpenAI API key (sidebar).")
+    elif not keywords:
+        st.warning("Add at least one prompt.")
+    else:
+        if len(keywords) > MAX_KEYWORDS:
+            st.warning(f"You entered {len(keywords)} prompts. Generating first {MAX_KEYWORDS} to avoid rate limits.")
+            keywords = keywords[:MAX_KEYWORDS]
+
+        # Decide OpenAI base size
+        if openai_size_mode == "Auto-pick for preset":
+            openai_size = pick_openai_size_for_target(target_w, target_h)
+        else:
+            openai_size = forced_size
+
+        client = OpenAIClient(api_key=openai_key)
+
+        zip_buffer = io.BytesIO()
+        zf = zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED)
+
+        previews = []
+        errors = []
+
+        for i, kw in enumerate(keywords, start=1):
+            with st.status(f"Generating {i}/{len(keywords)} — {kw}", expanded=False):
+                webp_bytes, err = generate_capcut_image_webp(
+                    client=client,
+                    prompt=kw,
+                    model=model,
+                    openai_size=openai_size,
+                    target_w=target_w,
+                    target_h=target_h,
+                    webp_quality=webp_quality,
+                )
+                if err:
+                    errors.append((kw, err))
+                    st.error(err)
+                    continue
+
+                fname = f"{slugify(kw)}.webp"
+                zf.writestr(fname, webp_bytes)
+                previews.append({"caption": kw, "bytes": webp_bytes, "fname": fname})
+                st.success(f"Done: {fname}")
+
+        zf.close()
+        zip_buffer.seek(0)
+
+        if previews:
+            st.subheader("Previews")
+            cols = st.columns(3)
+            for idx, item in enumerate(previews):
+                with cols[idx % 3]:
+                    st.image(item["bytes"], caption=item["caption"], use_container_width=True)
+                    st.download_button(
+                        "Download WEBP",
+                        data=item["bytes"],
+                        file_name=item["fname"],
+                        mime="image/webp",
+                        key=f"dl-{idx}-{item['fname']}",
+                    )
+
+        if errors:
+            st.subheader("Errors")
+            for kw, err in errors:
+                st.error(f"{kw}: {err}")
+
+        st.subheader("Download")
+        st.download_button(
+            label="Download all images as ZIP",
+            data=zip_buffer.getvalue(),
+            file_name="uapforge_images.zip",
+            mime="application/zip",
+            key="zip-all",
+        )

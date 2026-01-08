@@ -1,4 +1,4 @@
-# app.py — UAPForge (AI Render only) v1.2 (Streamlit Cloud hardened)
+# app.py — UAPForge (AI Render only) v1.2 (Streamlit Cloud hardened) — FIXED
 import base64
 import io
 import time
@@ -9,6 +9,7 @@ from typing import Optional, Tuple
 import requests
 import streamlit as st
 from PIL import Image
+import PIL  # ✅ FIX: used for Pillow version safely
 
 APP_TITLE = "UAPForge — AI Render (CapCut Ready)"
 
@@ -47,7 +48,7 @@ def encode_image_bytes(img: Image.Image, quality: int) -> Tuple[bytes, str, str]
     """
     buf = io.BytesIO()
     try:
-        # Keep this minimal to avoid codec/option issues on Streamlit Cloud
+        # Keep options minimal to avoid codec/option issues on Streamlit Cloud
         img.save(buf, format="WEBP", quality=int(quality))
         return buf.getvalue(), "webp", "image/webp"
     except Exception:
@@ -156,11 +157,11 @@ st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 st.caption("AI-only image generation. Outputs are cropped/resized for CapCut.")
 
-# show versions to help diagnose environment
+# ✅ FIXED debug environment block (safe)
 with st.expander("Environment (for debugging)", expanded=False):
     st.write("Streamlit:", st.__version__)
     st.write("Requests:", requests.__version__)
-    st.write("Pillow:", Image.__module__)
+    st.write("Pillow:", PIL.__version__)
 
 # Secrets first
 try:
